@@ -1,0 +1,84 @@
+#######################################
+# Syntax Coloring Map for ADRF6655
+#######################################
+
+#######################################
+# Class (KEYWORD1)
+#######################################
+
+ADRF6655	KEYWORD1
+
+#######################################
+# Methods and Functions (KEYWORD2)
+#######################################
+
+begin	KEYWORD2
+writeRegister	KEYWORD2
+
+configureR0_IntegerDivide	KEYWORD2
+configureR1_Modulus	KEYWORD2
+configureR2_Fractional	KEYWORD2
+configureR3_Dither	KEYWORD2
+configureR4_ChargePumpPFD	KEYWORD2
+configureR5_LOPathMixer	KEYWORD2
+configureR6_VCOControl	KEYWORD2
+configureR7_ExternalVCO	KEYWORD2
+
+deactivate	KEYWORD2
+activate	KEYWORD2
+enterDeepStandby	KEYWORD2
+wakeFromStandby	KEYWORD2
+
+setFrequency	KEYWORD2
+setFrequencyManual	KEYWORD2
+setLockWaitMs	KEYWORD2
+setPFDFrequencyMHz	KEYWORD2
+getPFDFrequencyMHz	KEYWORD2
+getFrequency	KEYWORD2
+isLocked	KEYWORD2
+
+powerOnSequence	KEYWORD2
+printStatus	KEYWORD2
+getShadowReg	KEYWORD2
+
+#######################################
+# Constants (LITERAL1)
+#######################################
+
+MUXOUT_LOCK_DETECT	LITERAL1
+MUXOUT_VPTAT	LITERAL1
+MUXOUT_REFIN_BUFFERED	LITERAL1
+MUXOUT_REFIN_2X_BUF	LITERAL1
+MUXOUT_REFIN_HALF	LITERAL1
+MUXOUT_TRISTATE	LITERAL1
+
+REF_PATH_2X	LITERAL1
+REF_PATH_1X	LITERAL1
+REF_PATH_HALF	LITERAL1
+REF_PATH_QUARTER	LITERAL1
+
+CP_BOTH_ON	LITERAL1
+CP_PUMP_DOWN	LITERAL1
+CP_PUMP_UP	LITERAL1
+CP_TRISTATE	LITERAL1
+
+ABD_0ns	LITERAL1
+ABD_0p5ns	LITERAL1
+ABD_0p75ns	LITERAL1
+ABD_0p9ns	LITERAL1
+
+LO_DIV_BY_3	LITERAL1
+LO_DIV_BY_2	LITERAL1
+
+LO_FREQ_MIN_MHZ	LITERAL1
+LO_FREQ_MAX_MHZ	LITERAL1
+LO_LDIV_THRESHOLD_MHZ	LITERAL1
+
+INT_FRAC_MODE_MIN	LITERAL1
+INT_FRAC_MODE_MAX	LITERAL1
+INT_INT_MODE_MIN	LITERAL1
+INT_INT_MODE_MAX	LITERAL1
+
+MOD_MIN	LITERAL1
+MOD_MAX	LITERAL1
+DEFAULT_MOD	LITERAL1
