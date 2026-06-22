@@ -51,7 +51,7 @@
  */
 
 #include <Arduino.h>
-#include <ADRF6655.h>
+#include "ADRF6655.h"
 
 // ── Pin assignments ────────────────────────────────────────────────
 static const uint8_t PIN_LE     =  5;
