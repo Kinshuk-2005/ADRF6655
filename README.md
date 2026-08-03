@@ -74,7 +74,8 @@ mode you pass in explicitly.
 | LE | any GPIO (constructor argument) |
 | MUXOUT | any GPIO (optional, for lock-detect) |
 
-All `VCC*` pins → +5 V. Exposed paddle → soldered ground plane.
+Power the ADRF6655 chip using an external 5V supply
+Also, connect the ADRF6655 IP3SET pin to 3.3V supply
 
 ## Quick start
 
