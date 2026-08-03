@@ -75,6 +75,7 @@ mode you pass in explicitly.
 | MUXOUT | any GPIO (optional, for lock-detect) |
 
 Power the ADRF6655 chip using an external 5V supply
+
 Also, connect the ADRF6655 IP3SET pin to 3.3V supply
 
 ## Quick start
