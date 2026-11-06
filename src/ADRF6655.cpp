@@ -22,8 +22,11 @@
 ADRF6655::ADRF6655(uint8_t lePin, uint32_t spiSpeed)
     : _lePin(lePin),
       _spiSpeed(spiSpeed),
-      _refMHz(20.0),
-      _pfdMHz(20.0),
+      _refHz(20000000UL),
+      _pfdHz(20000000UL),
+      _mod(DEFAULT_MOD),
+      _autoMod(false),
+      _lastErrHz(0),
       _lockWaitMs(20)
 {
     memset(_shadow, 0, sizeof(_shadow));
@@ -33,16 +36,16 @@ ADRF6655::ADRF6655(uint8_t lePin, uint32_t spiSpeed)
 //  begin
 // ─────────────────────────────────────────────────────────────────
 
-void ADRF6655::begin(double refFreqMHz, int sckPin, int mosiPin)
+void ADRF6655::begin(double refFreqMHz, int sckPin, int mosiPin, bool autoStart)
 {
-    _refMHz = refFreqMHz;
-    _pfdMHz = refFreqMHz;   // default 1:1; R4 config updates this
+    _refHz = (uint32_t)(refFreqMHz * 1e6 + 0.5);
+    _pfdHz = _refHz;        // default 1:1; R4 config updates this
 
     pinMode(_lePin, OUTPUT);
     digitalWrite(_lePin, LOW);  // LE idles LOW
 
     // On ESP32 SPI.begin(sck, miso, mosi, ss); MISO unused, ss=-1 (manual LE)
-#if defined(ESP32) || defined(ESP8266)
+#if defined(ESP32)
     if (sckPin >= 0 && mosiPin >= 0) {
         SPI.begin(sckPin, /*miso=*/-1, mosiPin, /*ss=*/-1);
     } else {
@@ -53,7 +56,7 @@ void ADRF6655::begin(double refFreqMHz, int sckPin, int mosiPin)
     SPI.begin();
 #endif
 
-    powerOnSequence();
+    powerOnSequence(autoStart);
 }
 
 // ─────────────────────────────────────────────────────────────────
@@ -106,15 +109,13 @@ void ADRF6655::writeRegister(uint8_t address, uint32_t bitmask)
 //  DB2:DB0           address 000  (inserted by writeRegister)
 // ─────────────────────────────────────────────────────────────────
 
-void ADRF6655::configureR0_IntegerDivide(bool integerMode, uint8_t integerDivRatio)
+bool ADRF6655::configureR0_IntegerDivide(bool integerMode, uint8_t integerDivRatio)
 {
-    // Clamp INT to the valid range for the selected mode
+    // Reject INT outside the valid range for the selected mode
     if (integerMode) {
-        if (integerDivRatio < INT_INT_MODE_MIN)  integerDivRatio = INT_INT_MODE_MIN;
-        if (integerDivRatio > INT_INT_MODE_MAX)  integerDivRatio = INT_INT_MODE_MAX;
+        if (integerDivRatio < INT_INT_MODE_MIN  || integerDivRatio > INT_INT_MODE_MAX)  return false;
     } else {
-        if (integerDivRatio < INT_FRAC_MODE_MIN) integerDivRatio = INT_FRAC_MODE_MIN;
-        if (integerDivRatio > INT_FRAC_MODE_MAX) integerDivRatio = INT_FRAC_MODE_MAX;
+        if (integerDivRatio < INT_FRAC_MODE_MIN || integerDivRatio > INT_FRAC_MODE_MAX) return false;
     }
 
     uint32_t bitmask = 0;
@@ -124,6 +125,7 @@ void ADRF6655::configureR0_IntegerDivide(bool integerMode, uint8_t integerDivRat
     bitmask |= ((uint32_t)(integerDivRatio & 0x7F) << 3); // DB9:DB3: ID6:ID0
 
     writeRegister(0, bitmask);
+    return true;
 }
 
 // ─────────────────────────────────────────────────────────────────
@@ -133,14 +135,14 @@ void ADRF6655::configureR0_IntegerDivide(bool integerMode, uint8_t integerDivRat
 //  DB2:DB0             address 001
 // ─────────────────────────────────────────────────────────────────
 
-void ADRF6655::configureR1_Modulus(uint16_t modulusValue)
+bool ADRF6655::configureR1_Modulus(uint16_t modulusValue)
 {
-    if (modulusValue < MOD_MIN) modulusValue = MOD_MIN;
-    if (modulusValue > MOD_MAX) modulusValue = MOD_MAX;
+    if (modulusValue < MOD_MIN || modulusValue > MOD_MAX) return false;
 
     // DB13:DB3 – 11-bit MOD
     uint32_t bitmask = (uint32_t)(modulusValue & 0x7FF) << 3;
     writeRegister(1, bitmask);
+    return true;
 }
 
 // ─────────────────────────────────────────────────────────────────
@@ -150,13 +152,14 @@ void ADRF6655::configureR1_Modulus(uint16_t modulusValue)
 //  DB2:DB0             address 010
 // ─────────────────────────────────────────────────────────────────
 
-void ADRF6655::configureR2_Fractional(uint16_t fractionalValue)
+bool ADRF6655::configureR2_Fractional(uint16_t fractionalValue)
 {
-    if (fractionalValue > 0x7FF) fractionalValue = 0x7FF;  // 11-bit safety clamp
+    if (fractionalValue > 0x7FF) return false;  // 11-bit field
 
     // DB13:DB3 – 11-bit FRAC
     uint32_t bitmask = (uint32_t)(fractionalValue & 0x7FF) << 3;
     writeRegister(2, bitmask);
+    return true;
 }
 
 // ─────────────────────────────────────────────────────────────────
@@ -174,17 +177,21 @@ void ADRF6655::configureR2_Fractional(uint16_t fractionalValue)
 //    magnitude  1 → DITH1:DITH0 = 11  (recommended when enabled)
 // ─────────────────────────────────────────────────────────────────
 
-void ADRF6655::configureR3_Dither(bool     ditherEnable,
+bool ADRF6655::configureR3_Dither(bool     ditherEnable,
                                    uint8_t  ditherMagnitude,
                                    uint32_t ditherRestartValue)
 {
+    // Magnitude must be exactly one of the four encodable values.
     uint8_t dithBits;
-    if      (ditherMagnitude >= 15) dithBits = 0b00;
-    else if (ditherMagnitude >=  7) dithBits = 0b01;
-    else if (ditherMagnitude >=  3) dithBits = 0b10;
-    else                            dithBits = 0b11;  // magnitude=1
+    switch (ditherMagnitude) {
+        case 15: dithBits = 0b00; break;
+        case  7: dithBits = 0b01; break;
+        case  3: dithBits = 0b10; break;
+        case  1: dithBits = 0b11; break;
+        default: return false;
+    }
 
-    if (ditherRestartValue > 0x1FFFFUL) ditherRestartValue = 1UL;
+    if (ditherRestartValue > 0x1FFFFUL) return false;   // 17-bit field
 
     uint32_t bitmask = 0;
     bitmask |= ((uint32_t)(dithBits & 0x03) << 21);           // DB22:DB21 – DITH
@@ -192,6 +199,7 @@ void ADRF6655::configureR3_Dither(bool     ditherEnable,
     bitmask |= ((ditherRestartValue & 0x1FFFFUL) << 3);        // DB19:DB3 – DV16:DV0
 
     writeRegister(3, bitmask);
+    return true;
 }
 
 // ─────────────────────────────────────────────────────────────────
@@ -211,7 +219,7 @@ void ADRF6655::configureR3_Dither(bool     ditherEnable,
 //  DB2:DB0                address 100
 // ─────────────────────────────────────────────────────────────────
 
-void ADRF6655::configureR4_ChargePumpPFD(uint8_t muxoutSource,
+bool ADRF6655::configureR4_ChargePumpPFD(uint8_t muxoutSource,
                                           uint8_t refPathSource,
                                           bool    useExternalRset,
                                           bool    phaseOffsetPositive,
@@ -223,14 +231,13 @@ void ADRF6655::configureR4_ChargePumpPFD(uint8_t muxoutSource,
                                           bool    refEdgeFalling,
                                           uint8_t antibacklashDelay)
 {
-    // Input clamping
-    if (muxoutSource > 7)           muxoutSource = MUXOUT_LOCK_DETECT;
-    if (refPathSource > 3)          refPathSource = REF_PATH_1X;
-    if (phaseOffsetMultiplier > 31) phaseOffsetMultiplier = 4;
-    if (cpCurrentMultiplier < 1)    cpCurrentMultiplier = 1;
-    if (cpCurrentMultiplier > 4)    cpCurrentMultiplier = 4;
-    if (cpForceState > 3)           cpForceState = CP_BOTH_ON;
-    if (antibacklashDelay > 3)      antibacklashDelay = ABD_0ns;
+    // Input validation (nothing is written if any argument is invalid)
+    if (muxoutSource > 7 || muxoutSource == 5 || muxoutSource == 6) return false; // 5,6 reserved
+    if (refPathSource > 3)           return false;
+    if (phaseOffsetMultiplier > 31)  return false;
+    if (cpCurrentMultiplier < 1 || cpCurrentMultiplier > 4) return false;
+    if (cpForceState > 3)            return false;
+    if (antibacklashDelay > 3)       return false;
 
     // CPP encoding: multiplier 1→00, 2→01, 3→10, 4→11
     uint8_t cppBits = (cpCurrentMultiplier - 1) & 0x03;
@@ -248,15 +255,16 @@ void ADRF6655::configureR4_ChargePumpPFD(uint8_t muxoutSource,
     if (!refEdgeFalling)       bitmask |= (1UL << 5);           // DB5 – PE0
     bitmask |= ((uint32_t)(antibacklashDelay & 0x03) << 3);     // DB4:DB3 – PAB
 
-    // Update _pfdMHz so setFrequency() calculations stay correct
+    // Update _pfdHz so setFrequency() calculations stay correct
     switch (refPathSource) {
-        case REF_PATH_2X:      _pfdMHz = _refMHz * 2.0; break;
-        case REF_PATH_1X:      _pfdMHz = _refMHz;        break;
-        case REF_PATH_HALF:    _pfdMHz = _refMHz / 2.0;  break;
-        case REF_PATH_QUARTER: _pfdMHz = _refMHz / 4.0;  break;
+        case REF_PATH_2X:      _pfdHz = _refHz * 2UL; break;
+        case REF_PATH_1X:      _pfdHz = _refHz;       break;
+        case REF_PATH_HALF:    _pfdHz = _refHz / 2UL; break;
+        case REF_PATH_QUARTER: _pfdHz = _refHz / 4UL; break;
     }
 
     writeRegister(4, bitmask);
+    return true;
 }
 
 // ─────────────────────────────────────────────────────────────────
@@ -274,14 +282,15 @@ void ADRF6655::configureR4_ChargePumpPFD(uint8_t muxoutSource,
 //  DB2:DB0               address 101
 // ─────────────────────────────────────────────────────────────────
 
-void ADRF6655::configureR5_LOPathMixer(bool    mixerBiasEnable,
+bool ADRF6655::configureR5_LOPathMixer(bool    mixerBiasEnable,
                                         uint8_t cdacValue,
                                         bool    pllEnable,
                                         uint8_t loDivider,
                                         bool    loExternal,
                                         bool    loOutputDriverOn)
 {
-    if (cdacValue > 15) cdacValue = 15;
+    if (cdacValue > 15) return false;
+    if (loDivider != LO_DIV_BY_2 && loDivider != LO_DIV_BY_3) return false;
 
     uint32_t bitmask = 0;
     bitmask |= ((uint32_t)(cdacValue & 0x0F) << 8);  // DB11:DB8 – CDAC
@@ -293,6 +302,7 @@ void ADRF6655::configureR5_LOPathMixer(bool    mixerBiasEnable,
     if (loOutputDriverOn)   bitmask |= (1UL << 3);    // DB3  – LDRV
 
     writeRegister(5, bitmask);
+    return true;
 }
 
 // ─────────────────────────────────────────────────────────────────
@@ -312,7 +322,7 @@ void ADRF6655::configureR5_LOPathMixer(bool    mixerBiasEnable,
 //  DB2:DB0              address 110
 // ─────────────────────────────────────────────────────────────────
 
-void ADRF6655::configureR6_VCOControl(bool    chargePumpEnable,
+bool ADRF6655::configureR6_VCOControl(bool    chargePumpEnable,
                                        bool    ldo3v3Enable,
                                        bool    vcoLdoEnable,
                                        bool    vcoEnable,
@@ -321,8 +331,7 @@ void ADRF6655::configureR6_VCOControl(bool    chargePumpEnable,
                                        bool    vcoBandFromSPI,
                                        uint8_t vcoBandSelect)
 {
-    if (vcoAmplitude > 63)  vcoAmplitude = 47;  // clamp to max; keep recommended if exceeded
-    if (vcoBandSelect > 63) vcoBandSelect = 0;
+    if (vcoAmplitude > 63 || vcoBandSelect > 63) return false;   // 6-bit fields
 
     uint32_t bitmask = 0;
     if (chargePumpEnable)  bitmask |= (1UL << 20);                   // DB20 – CPEN
@@ -335,6 +344,7 @@ void ADRF6655::configureR6_VCOControl(bool    chargePumpEnable,
     bitmask |= ((uint32_t)(vcoBandSelect & 0x3F) << 3);              // DB8:DB3  – VBS5:VBS0
 
     writeRegister(6, bitmask);
+    return true;
 }
 
 // ─────────────────────────────────────────────────────────────────
@@ -344,12 +354,13 @@ void ADRF6655::configureR6_VCOControl(bool    chargePumpEnable,
 //  DB2:DB0     address 111
 // ─────────────────────────────────────────────────────────────────
 
-void ADRF6655::configureR7_ExternalVCO(bool useExternalVCO)
+bool ADRF6655::configureR7_ExternalVCO(bool useExternalVCO)
 {
     uint32_t bitmask = 0;
     if (useExternalVCO) bitmask |= (1UL << 22);   // DB22 – XVCO
 
     writeRegister(7, bitmask);
+    return true;
 }
 
 // ─────────────────────────────────────────────────────────────────
@@ -405,10 +416,23 @@ void ADRF6655::wakeFromStandby()
 //  powerOnSequence
 // ─────────────────────────────────────────────────────────────────
 
-void ADRF6655::powerOnSequence()
+void ADRF6655::powerOnSequence(bool loadPlaceholder)
 {
-    // ── Phase 2: Hardware & Base Block Initialisation ────────────
-    // Write static configuration registers with PLL kept dark.
+    _baseBlockInit();
+
+    // ── Phase 3: Frequency Load & Activation ─────────────────────
+    // Placeholder: INT=87, integer mode → fLO = 87 × 20 MHz = 1740 MHz
+    // Call setFrequency() after begin() to go to your actual target.
+    // Skipped when begin(..., autoStart=false): the PLL then stays off
+    // (PLEN=0) until the first setFrequency().
+    if (loadPlaceholder)
+        _phaseThreeSequence(/*integerMode=*/true, /*INT=*/87,
+                            /*MOD=*/DEFAULT_MOD, /*FRAC=*/0);
+}
+
+// Phase 2: write the static configuration registers with the PLL dark.
+void ADRF6655::_baseBlockInit()
+{
 
     // R7: use internal VCO
     configureR7_ExternalVCO(false);
@@ -453,12 +477,6 @@ void ADRF6655::powerOnSequence()
 
     // R3: dither disabled (recommended), restart value=1
     configureR3_Dither(false, 1, 1);
-
-    // ── Phase 3: Frequency Load & Activation ─────────────────────
-    // Placeholder: INT=87, integer mode → fLO = 87 × 20 MHz = 1740 MHz
-    // Call setFrequency() after begin() to go to your actual target.
-    _phaseThreeSequence(/*integerMode=*/true, /*INT=*/87,
-                        /*MOD=*/DEFAULT_MOD, /*FRAC=*/0);
 }
 
 // ─────────────────────────────────────────────────────────────────
@@ -505,25 +523,71 @@ void ADRF6655::_phaseThreeSequence(bool     integerMode,
 //  setFrequency
 // ─────────────────────────────────────────────────────────────────
 
+// Fractional word for a remainder: round(remHz * mod / pfdHz).
+uint16_t ADRF6655::_fracFor(uint32_t remHz, uint32_t pfdHz, uint16_t mod)
+{
+    return (uint16_t)(((uint64_t)remHz * mod + (pfdHz >> 1)) / pfdHz);
+}
+
+// Search MOD = 1..2047 for the smallest |error|; first (smallest) MOD wins ties.
+void ADRF6655::_bestMod(uint32_t remHz, uint32_t pfdHz,
+                        uint16_t &mod, uint16_t &frac)
+{
+    uint32_t bestErr = 0xFFFFFFFFUL;
+    uint16_t bestMod = 1, bestFrac = 0;
+    for (uint16_t m = 1; m <= MOD_MAX; m++) {
+        uint16_t f = _fracFor(remHz, pfdHz, m);
+        uint64_t approx = ((uint64_t)pfdHz * f + (m >> 1)) / m;   // Hz above INT
+        uint32_t err = (approx > remHz) ? (uint32_t)(approx - remHz)
+                                        : (uint32_t)(remHz - approx);
+        if (err < bestErr) { bestErr = err; bestMod = m; bestFrac = f; }
+        if (err == 0) break;
+    }
+    mod = bestMod;
+    frac = bestFrac;
+}
+
 bool ADRF6655::setFrequency(double loFreqMHz)
 {
-    // ── Range check ───────────────────────────────────────────────
-    if (loFreqMHz < LO_FREQ_MIN_MHZ || loFreqMHz > LO_FREQ_MAX_MHZ) {
+    // Range check in floating point first so negatives/NaN never reach the
+    // unsigned conversion; the exact check is repeated on the integer value.
+    if (!(loFreqMHz >= LO_FREQ_MIN_MHZ && loFreqMHz <= LO_FREQ_MAX_MHZ)) {
         Serial.print(F("[ADRF6655] setFrequency out of range: "));
         Serial.print(loFreqMHz, 3);
-        Serial.println(F(" MHz  (valid: 1050–2300 MHz)"));
+        Serial.println(F(" MHz  (valid: 1050-2300 MHz)"));
+        return false;
+    }
+    // NOTE: on AVR `double` is 32-bit, so this conversion is good to ~100 Hz.
+    // Use setFrequencyHz() when you need an exact Hz value on AVR.
+    return setFrequencyHz((uint64_t)(loFreqMHz * 1e6 + 0.5));
+}
+
+bool ADRF6655::setFrequencyHz(uint64_t loHz)
+{
+    // ── Range check ───────────────────────────────────────────────
+    if (loHz < LO_FREQ_MIN_HZ || loHz > LO_FREQ_MAX_HZ) {
+        Serial.println(F("[ADRF6655] setFrequencyHz out of range (valid: 1050-2300 MHz)"));
         return false;
     }
 
-    // ── Calculate N = fLO / fPFD ──────────────────────────────────
-    double   N       = loFreqMHz / _pfdMHz;
-    uint8_t  intVal  = (uint8_t)N;              // floor(N)
-    double   rem     = N - (double)intVal;
+    // ── N = fLO / fPFD in exact integer arithmetic ────────────────
+    // INT is kept 32-bit until it has been range-checked, so a small PFD
+    // (e.g. REF_PATH_QUARTER) can no longer wrap a uint8_t into range.
+    const uint32_t pfd     = _pfdHz;
+    uint32_t       intVal  = (uint32_t)(loHz / pfd);
+    const uint32_t remHz   = (uint32_t)(loHz % pfd);
 
-    uint16_t modVal  = DEFAULT_MOD;
-    uint16_t fracVal = (uint16_t)round(rem * modVal);
+    uint16_t modVal  = _mod;
+    uint16_t fracVal;
+    if (remHz == 0) {
+        fracVal = 0;                         // exact integer N
+    } else if (_autoMod) {
+        _bestMod(remHz, pfd, modVal, fracVal);
+    } else {
+        fracVal = _fracFor(remHz, pfd, modVal);
+    }
 
-    // Guard: rounding can push FRAC exactly to MOD
+    // Guard: rounding can push FRAC exactly to MOD → carry into INT
     if (fracVal >= modVal) {
         fracVal = 0;
         intVal++;
@@ -532,7 +596,7 @@ bool ADRF6655::setFrequency(double loFreqMHz)
     // ── Decide mode ───────────────────────────────────────────────
     // FRAC = 0  →  integer mode (DM=1), wider INT range 21–123
     // FRAC ≠ 0  →  fractional mode (DM=0), INT range 24–119
-    bool integerMode = (fracVal == 0);
+    const bool integerMode = (fracVal == 0);
 
     // ── Validate INT for the selected mode ────────────────────────
     if (integerMode) {
@@ -547,10 +611,18 @@ bool ADRF6655::setFrequency(double loFreqMHz)
         }
     }
 
+    // ── Achieved frequency / error (for getLastFrequencyErrorHz) ──
+    {
+        uint64_t achieved = (uint64_t)pfd * intVal;
+        if (fracVal)
+            achieved += ((uint64_t)pfd * fracVal + (modVal >> 1)) / modVal;
+        _lastErrHz = (int32_t)((int64_t)achieved - (int64_t)loHz);
+    }
+
     // ── Select LO divider ─────────────────────────────────────────
-    uint8_t loDivider = (loFreqMHz >= LO_LDIV_THRESHOLD_MHZ)
-                        ? LO_DIV_BY_2    // 1530–2300 MHz
-                        : LO_DIV_BY_3;   // 1050–1530 MHz
+    const uint8_t loDivider = (loHz >= LO_LDIV_THRESHOLD_HZ)
+                              ? LO_DIV_BY_2    // 1530–2300 MHz
+                              : LO_DIV_BY_3;   // 1050–1530 MHz
 
     // ── Deactivate PLL (PLEN=0) ───────────────────────────────────
     deactivate();
@@ -566,10 +638,20 @@ bool ADRF6655::setFrequency(double loFreqMHz)
     }
 
     // ── Phase 3: R2 → R1 → wait → PLEN=1 → wait → R0 ────────────
-    _phaseThreeSequence(integerMode, intVal, modVal, fracVal);
+    _phaseThreeSequence(integerMode, (uint8_t)intVal, modVal, fracVal);
 
     return true;
 }
+
+bool ADRF6655::setModulus(uint16_t mod)
+{
+    if (mod < MOD_MIN || mod > MOD_MAX) return false;
+    _mod = mod;
+    return true;
+}
+
+void ADRF6655::setAutoModulus(bool enable)   { _autoMod = enable; }
+int32_t ADRF6655::getLastFrequencyErrorHz() const { return _lastErrHz; }
 
 // ─────────────────────────────────────────────────────────────────
 //  setFrequencyManual
@@ -580,7 +662,16 @@ bool ADRF6655::setFrequencyManual(bool     integerMode,
                                    uint16_t modVal,
                                    uint16_t fracVal)
 {
-    // Validate inputs before touching hardware
+    // Validate inputs before touching hardware.  MOD/FRAC are range-checked
+    // in both modes because R1/R2 are always written (and cached).
+    if (modVal < MOD_MIN || modVal > MOD_MAX) {
+        Serial.println(F("[ADRF6655] Manual: MOD out of range (1-2047)"));
+        return false;
+    }
+    if (fracVal > 0x7FF) {
+        Serial.println(F("[ADRF6655] Manual: FRAC out of range (0-2047)"));
+        return false;
+    }
     if (integerMode) {
         if (intVal < INT_INT_MODE_MIN || intVal > INT_INT_MODE_MAX) {
             Serial.println(F("[ADRF6655] Manual: INT out of range (integer 21-123)"));
@@ -589,10 +680,6 @@ bool ADRF6655::setFrequencyManual(bool     integerMode,
     } else {
         if (intVal < INT_FRAC_MODE_MIN || intVal > INT_FRAC_MODE_MAX) {
             Serial.println(F("[ADRF6655] Manual: INT out of range (fractional 24-119)"));
-            return false;
-        }
-        if (modVal < MOD_MIN || modVal > MOD_MAX) {
-            Serial.println(F("[ADRF6655] Manual: MOD out of range (1-2047)"));
             return false;
         }
         if (fracVal >= modVal) {
@@ -617,16 +704,27 @@ bool ADRF6655::setFrequencyManual(bool     integerMode,
 // ─────────────────────────────────────────────────────────────────
 
 void ADRF6655::setLockWaitMs(uint16_t ms)       { _lockWaitMs = ms; }
-void ADRF6655::setPFDFrequencyMHz(double pfdMHz) { _pfdMHz = pfdMHz; }
-double ADRF6655::getPFDFrequencyMHz() const      { return _pfdMHz; }
+void ADRF6655::setPFDFrequencyMHz(double pfdMHz)
+{
+    if (pfdMHz > 0.0) _pfdHz = (uint32_t)(pfdMHz * 1e6 + 0.5);
+}
+double ADRF6655::getPFDFrequencyMHz() const      { return (double)_pfdHz / 1e6; }
+
+uint64_t ADRF6655::getFrequencyHz() const
+{
+    uint8_t  intVal  = (_shadow[0] >> 3) & 0x7F;
+    bool     intMode = (_shadow[0] >> 10) & 0x01;   // DM: MOD/FRAC ignored
+    uint16_t modVal  = (_shadow[1] >> 3) & 0x7FF;
+    uint16_t fracVal = (_shadow[2] >> 3) & 0x7FF;
+    uint64_t hz = (uint64_t)_pfdHz * intVal;
+    if (!intMode && modVal != 0 && fracVal != 0)
+        hz += ((uint64_t)_pfdHz * fracVal + (modVal >> 1)) / modVal;
+    return hz;
+}
 
 double ADRF6655::getFrequency() const
 {
-    uint8_t  intVal  = (_shadow[0] >> 3) & 0x7F;
-    uint16_t modVal  = (_shadow[1] >> 3) & 0x7FF;
-    uint16_t fracVal = (_shadow[2] >> 3) & 0x7FF;
-    if (modVal == 0) return _pfdMHz * intVal;
-    return _pfdMHz * ((double)intVal + (double)fracVal / (double)modVal);
+    return (double)getFrequencyHz() / 1e6;
 }
 
 bool ADRF6655::isLocked(uint8_t muxoutPin) const
@@ -658,8 +756,8 @@ void ADRF6655::printStatus() const
     Serial.println(F("━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"));
     Serial.println(F("  ADRF6655 Status"));
     Serial.println(F("━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"));
-    Serial.print(F("  REFIN        : ")); Serial.print(_refMHz, 4); Serial.println(F(" MHz"));
-    Serial.print(F("  fPFD         : ")); Serial.print(_pfdMHz, 4); Serial.println(F(" MHz"));
+    Serial.print(F("  REFIN        : ")); Serial.print((double)_refHz / 1e6, 4); Serial.println(F(" MHz"));
+    Serial.print(F("  fPFD         : ")); Serial.print((double)_pfdHz / 1e6, 4); Serial.println(F(" MHz"));
     Serial.print(F("  Mode         : ")); Serial.println(intMode ? F("Integer (DM=1)") : F("Fractional (DM=0)"));
     Serial.print(F("  INT          : ")); Serial.println(intVal);
     Serial.print(F("  MOD          : ")); Serial.println(modVal);
@@ -670,12 +768,35 @@ void ADRF6655::printStatus() const
     Serial.print(F("  CDAC         : ")); Serial.println(cdac);
     Serial.print(F("  VCO source   : ")); Serial.println(extVCO ? F("external") : F("internal"));
     Serial.print(F("  Computed fLO : ")); Serial.print(getFrequency(), 4); Serial.println(F(" MHz"));
+    Serial.print(F("  Last freq err: ")); Serial.print(_lastErrHz); Serial.println(F(" Hz"));
+    Serial.print(F("  MOD mode     : ")); Serial.println(_autoMod ? F("auto (best fit)") : F("fixed"));
+
+    // ── R3 / R4 / R6 decode ───────────────────────────────────────
+    {
+        static const uint8_t ditherMag[4] = {15, 7, 3, 1};
+        uint32_t r3 = _shadow[3], r4 = _shadow[4], r6 = _shadow[6];
+        Serial.print(F("  R3 dither    : ")); Serial.print((r3 >> 20) & 1 ? F("on") : F("off"));
+        Serial.print(F(", mag ")); Serial.print(ditherMag[(r3 >> 21) & 3]);
+        Serial.print(F(", restart ")); Serial.println((r3 >> 3) & 0x1FFFFUL);
+        Serial.print(F("  R4 MUXOUT    : ")); Serial.print((r4 >> 21) & 7);
+        Serial.print(F("  refPath ")); Serial.print((r4 >> 19) & 3);
+        Serial.print(F("  CP mult ")); Serial.print(((r4 >> 10) & 3) + 1);
+        Serial.print(F("  CPS ")); Serial.print((r4 >> 9) & 1);
+        Serial.print(F("  ABD ")); Serial.println((r4 >> 3) & 3);
+        Serial.print(F("  R6 enables   : CP=")); Serial.print((r6 >> 20) & 1);
+        Serial.print(F(" L3=")); Serial.print((r6 >> 19) & 1);
+        Serial.print(F(" LV=")); Serial.print((r6 >> 18) & 1);
+        Serial.print(F(" VCO=")); Serial.print((r6 >> 17) & 1);
+        Serial.print(F("  amp=")); Serial.print((r6 >> 10) & 0x3F);
+        Serial.print(F("  band=")); Serial.print(((r6 >> 9) & 1) ? (int)((r6 >> 3) & 0x3F) : -1);
+        Serial.println(F("  (-1 = auto-cal)"));
+    }
     Serial.println(F("  ── Shadow registers ──────────────────"));
     for (uint8_t i = 0; i < 8; i++) {
         Serial.print(F("  R")); Serial.print(i); Serial.print(F(" = 0x"));
         uint32_t v = _shadow[i];
         // Always print 6 hex digits (24-bit word)
-        char buf[7];
+        char buf[12];
         snprintf(buf, sizeof(buf), "%06lX", (unsigned long)v);
         Serial.println(buf);
     }

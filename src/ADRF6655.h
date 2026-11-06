@@ -118,6 +118,7 @@
 
 #include <Arduino.h>
 #include <SPI.h>
+#include <stdint.h>
 
 // ═══════════════════════════════════════════════════════════════════
 //  R4 constants – MUXOUT source  (DB23:DB21)
@@ -167,6 +168,9 @@
 #define LO_FREQ_MIN_MHZ         1050.0
 #define LO_FREQ_MAX_MHZ         2300.0
 #define LO_LDIV_THRESHOLD_MHZ   1530.0   // ≥ this → ÷2 mode
+#define LO_FREQ_MIN_HZ          1050000000ULL
+#define LO_FREQ_MAX_HZ          2300000000ULL
+#define LO_LDIV_THRESHOLD_HZ    1530000000ULL
 
 // ═══════════════════════════════════════════════════════════════════
 //  R0 INT field limits
@@ -203,10 +207,17 @@ public:
      * @param refFreqMHz  REFIN oscillator frequency (MHz).  Default 20.
      * @param sckPin      SCK  GPIO; -1 = use board default (18 on ESP32).
      * @param mosiPin     MOSI GPIO; -1 = use board default (23 on ESP32).
+     * @param autoStart   true  (default) = run the full power-on sequence,
+     *                    which parks the PLL at a 1740 MHz placeholder.
+     *                    false = write only the static base block (R7..R3)
+     *                    and leave the PLL OFF (PLEN=0) so the first
+     *                    setFrequency() does the one and only lock cycle
+     *                    (saves ~120 ms at start-up).
      */
     void begin(double refFreqMHz = 20.0,
                int    sckPin     = -1,
-               int    mosiPin    = -1);
+               int    mosiPin    = -1,
+               bool   autoStart  = true);
 
     // ═══════════════════════════════════════════════════════════════
     //  SINGLE WRITE PRIMITIVE
@@ -229,6 +240,11 @@ public:
 
     // ═══════════════════════════════════════════════════════════════
     //  REGISTER FUNCTIONS  (one per register, R0–R7)
+    //
+    //  Every configureRn_*() returns true if the word was written.
+    //  An out-of-range argument is REJECTED: the function returns false
+    //  and nothing is sent or cached.  (Up to v1.0.1 these silently
+    //  clamped or substituted values, which could hide caller bugs.)
     // ═══════════════════════════════════════════════════════════════
 
     // ── R0 ─────────────────────────────────────────────────────────
@@ -254,7 +270,7 @@ public:
      * @param integerMode      false=fractional, true=integer.
      * @param integerDivRatio  INT value, clamped to the correct range.
      */
-    void configureR0_IntegerDivide(bool    integerMode,
+    bool configureR0_IntegerDivide(bool    integerMode,
                                     uint8_t integerDivRatio);
 
     // ── R1 ─────────────────────────────────────────────────────────
@@ -268,7 +284,7 @@ public:
      *
      * @param modulusValue  MOD value, 1–2047.
      */
-    void configureR1_Modulus(uint16_t modulusValue);
+    bool configureR1_Modulus(uint16_t modulusValue);
 
     // ── R2 ─────────────────────────────────────────────────────────
     /**
@@ -281,7 +297,7 @@ public:
      *
      * @param fractionalValue  FRAC, 0 to (modulusValue-1).
      */
-    void configureR2_Fractional(uint16_t fractionalValue);
+    bool configureR2_Fractional(uint16_t fractionalValue);
 
     // ── R3 ─────────────────────────────────────────────────────────
     /**
@@ -297,7 +313,7 @@ public:
      * @param ditherMagnitude     15, 7, 3, or 1.
      * @param ditherRestartValue  0–131071.  Recommended: 1.
      */
-    void configureR3_Dither(bool     ditherEnable,
+    bool configureR3_Dither(bool     ditherEnable,
                              uint8_t  ditherMagnitude,
                              uint32_t ditherRestartValue);
 
@@ -318,7 +334,7 @@ public:
      *   DB5        PE0         ref-path edge: 0=falling
      *   DB4:DB3    PAB1:PAB0   antibacklash delay      (ABD_xxx)
      *
-     * Also updates internal _pfdMHz from refPathSource so that
+     * Also updates internal _pfdHz from refPathSource so that
      * subsequent setFrequency() calls use the correct PFD frequency.
      *
      * @param muxoutSource           MUXOUT_xxx constant
@@ -333,7 +349,7 @@ public:
      * @param refEdgeFalling         true = falling edge
      * @param antibacklashDelay      ABD_xxx constant
      */
-    void configureR4_ChargePumpPFD(uint8_t muxoutSource,
+    bool configureR4_ChargePumpPFD(uint8_t muxoutSource,
                                     uint8_t refPathSource,
                                     bool    useExternalRset,
                                     bool    phaseOffsetPositive,
@@ -370,7 +386,7 @@ public:
      * @param loOutputDriverOn   true = LO appears at LOP/LON for probing;
      *                           keep false for best RF performance & power
      */
-    void configureR5_LOPathMixer(bool    mixerBiasEnable,
+    bool configureR5_LOPathMixer(bool    mixerBiasEnable,
                                   uint8_t cdacValue,
                                   bool    pllEnable,
                                   uint8_t loDivider,
@@ -401,7 +417,7 @@ public:
      * @param vcoBandFromSPI    false = calibration selects band
      * @param vcoBandSelect     0–63; only used when vcoBandFromSPI=true
      */
-    void configureR6_VCOControl(bool    chargePumpEnable,
+    bool configureR6_VCOControl(bool    chargePumpEnable,
                                  bool    ldo3v3Enable,
                                  bool    vcoLdoEnable,
                                  bool    vcoEnable,
@@ -427,7 +443,7 @@ public:
      *
      * @param useExternalVCO  false=internal (default), true=external
      */
-    void configureR7_ExternalVCO(bool useExternalVCO);
+    bool configureR7_ExternalVCO(bool useExternalVCO);
 
     // ═══════════════════════════════════════════════════════════════
     //  PLL ACTIVATION / DEACTIVATION
@@ -500,6 +516,41 @@ public:
     bool setFrequency(double loFreqMHz);
 
     /**
+     * @brief Set the LO frequency in Hz (exact, integer arithmetic).
+     *
+     * Same sequence and mode selection as setFrequency(), but the
+     * divider maths is done entirely in 64-bit integers, so the result
+     * is exact on AVR too (where `double` is only 32-bit).  Prefer this
+     * on AVR; setFrequency(double) converts to Hz and calls this.
+     *
+     * @param loHz  Target LO frequency in Hz (1.05–2.3 GHz).
+     * @return true on success, false if out of range.
+     */
+    bool setFrequencyHz(uint64_t loHz);
+
+    /**
+     * @brief Fixed MOD used by setFrequency*() (default 1000).
+     *        Ignored while auto-modulus is enabled.  1–2047.
+     * @return false (unchanged) if outside 1–2047.
+     */
+    bool setModulus(uint16_t mod);
+
+    /**
+     * @brief Let setFrequency*() search MOD = 1..2047 for the smallest
+     *        frequency error instead of using the fixed MOD.
+     *        Default OFF (fixed MOD, identical to v1.0.x behaviour).
+     *        Costs a few hundred ms of CPU on AVR (64-bit maths), a
+     *        millisecond or so on ESP32.
+     */
+    void setAutoModulus(bool enable);
+
+    /**
+     * @brief Signed error (achieved − requested) of the last successful
+     *        setFrequency*() call, in Hz.  0 for integer-mode / exact hits.
+     */
+    int32_t getLastFrequencyErrorHz() const;
+
+    /**
      * @brief Set frequency using explicit INT / MOD / FRAC values.
      *
      * Runs the same Phase 3 sequence as setFrequency() but with values
@@ -543,6 +594,9 @@ public:
     /** @return LO frequency computed from shadow registers (MHz). */
     double getFrequency() const;
 
+    /** @return LO frequency computed from shadow registers (Hz, exact). */
+    uint64_t getFrequencyHz() const;
+
     /**
      * @brief Read lock-detect status from the MUXOUT pin.
      *
@@ -569,8 +623,10 @@ public:
      *
      * A placeholder frequency of INT=87 (1740 MHz @ 20 MHz PFD)
      * is programmed.  Call setFrequency() afterward.
+     *
+     * @param loadPlaceholder  false = stop after Phase 2 (PLL left off).
      */
-    void powerOnSequence();
+    void powerOnSequence(bool loadPlaceholder = true);
 
     // ═══════════════════════════════════════════════════════════════
     //  UTILITIES
@@ -589,8 +645,11 @@ public:
 private:
     uint8_t   _lePin;
     uint32_t  _spiSpeed;
-    double    _refMHz;
-    double    _pfdMHz;
+    uint32_t  _refHz;
+    uint32_t  _pfdHz;
+    uint16_t  _mod;
+    bool      _autoMod;
+    int32_t   _lastErrHz;
     uint16_t  _lockWaitMs;
     uint32_t  _shadow[8];
 
@@ -599,6 +658,10 @@ private:
     // Shared Phase-3 executor called by setFrequency() and setFrequencyManual().
     // Caller must already have: (a) called deactivate(), (b) updated LDIV in
     // the R5 shadow if the divider mode changed.
+    void _baseBlockInit();
+    static uint16_t _fracFor(uint32_t remHz, uint32_t pfdHz, uint16_t mod);
+    static void     _bestMod(uint32_t remHz, uint32_t pfdHz,
+                             uint16_t &mod, uint16_t &frac);
     void _phaseThreeSequence(bool     integerMode,
                               uint8_t  intVal,
                               uint16_t modVal,

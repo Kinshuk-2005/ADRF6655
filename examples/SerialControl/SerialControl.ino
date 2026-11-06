@@ -21,6 +21,12 @@
  *                             e.g.  m frac 87 1000 500
  *                                   m int  90 1000 0
  *
+ *   mod <1-2047>             Fixed MOD used by 'f' (default 1000 = 20 kHz
+ *                             steps at a 20 MHz PFD).  e.g.  mod 2000
+ *
+ *   automod <on|off>         Search MOD 1..2047 for the smallest frequency
+ *                             error on every 'f'.  Default off.
+ *
  *   status                   Print full decoded register status.
  *
  *   lock                     Print current PLL lock state.
@@ -67,6 +73,8 @@ void printHelp()
     Serial.println(F("──────────────────────────────────────────────"));
     Serial.println(F("  f <MHz>                          set LO frequency"));
     Serial.println(F("  m <int|frac> <INT> <MOD> <FRAC>   manual register set"));
+    Serial.println(F("  mod <1-2047>                      fixed MOD for 'f'"));
+    Serial.println(F("  automod <on|off>                  best-fit MOD search"));
     Serial.println(F("  status                            full register dump"));
     Serial.println(F("  lock                              show PLL lock state"));
     Serial.println(F("  lockwait <ms>                     set post-R0 wait"));
@@ -75,6 +83,32 @@ void printHelp()
     Serial.println(F("  wake                              restore from standby"));
     Serial.println(F("  help                              show this list"));
     Serial.println(F("──────────────────────────────────────────────"));
+}
+
+// Parse a decimal MHz string ("1740", "1740.5", "1740.012345") into exact Hz
+// using integer arithmetic only (String::toFloat() is a 32-bit float and
+// would lose ~100 Hz at 1.7 GHz).  Digits past the 6th decimal are dropped.
+static bool parseMHzToHz(const String &s, uint64_t &hz)
+{
+    uint64_t whole = 0, frac = 0;
+    uint32_t scale = 1000000UL;
+    int i = 0, n = s.length();
+    bool any = false;
+    for (; i < n && isDigit(s[i]); i++) {
+        whole = whole * 10 + (uint64_t)(s[i] - '0');
+        any = true;
+        if (whole > 100000ULL) return false;
+    }
+    if (i < n && s[i] == '.') {
+        i++;
+        for (; i < n && isDigit(s[i]); i++) {
+            any = true;
+            if (scale > 1) { scale /= 10; frac += (uint64_t)(s[i] - '0') * scale; }
+        }
+    }
+    if (i < n || !any) return false;
+    hz = whole * 1000000ULL + frac;
+    return true;
 }
 
 void handleCommand(String line)
@@ -104,15 +138,19 @@ void handleCommand(String line)
     // ── f <MHz> ──────────────────────────────────────────────────
     if (cmd == "f") {
         if (tokenCount < 2) { Serial.println(F("Usage: f <MHz>")); return; }
-        double freq = tokens[1].toFloat();
-        Serial.print(F("Setting LO to ")); Serial.print(freq, 4); Serial.println(F(" MHz ..."));
+        uint64_t hz;
+        if (!parseMHzToHz(tokens[1], hz)) { Serial.println(F("Could not parse frequency.")); return; }
+        Serial.print(F("Setting LO to ")); Serial.print(tokens[1]); Serial.println(F(" MHz ..."));
         uint32_t t0 = millis();
-        bool ok = synth.setFrequency(freq);
+        bool ok = synth.setFrequencyHz(hz);
         uint32_t elapsed = millis() - t0;
         if (ok) {
             bool locked = synth.isLocked(PIN_MUXOUT);
             Serial.print(F("Done in ")); Serial.print(elapsed); Serial.print(F(" ms. PLL: "));
-            Serial.println(locked ? F("LOCKED") : F("NOT LOCKED"));
+            Serial.print(locked ? F("LOCKED") : F("NOT LOCKED"));
+            Serial.print(F("  (achieved ")); Serial.print(synth.getFrequency(), 6);
+            Serial.print(F(" MHz, error ")); Serial.print(synth.getLastFrequencyErrorHz());
+            Serial.println(F(" Hz)"));
         } else {
             Serial.println(F("Failed: frequency out of range (1050-2300 MHz)."));
         }
@@ -160,6 +198,26 @@ void handleCommand(String line)
     else if (cmd == "lock") {
         bool locked = synth.isLocked(PIN_MUXOUT);
         Serial.print(F("PLL lock: ")); Serial.println(locked ? F("LOCKED") : F("NOT LOCKED"));
+    }
+
+    // ── mod <n> ──────────────────────────────────────────────────
+    else if (cmd == "mod") {
+        if (tokenCount < 2) { Serial.println(F("Usage: mod <1-2047>")); return; }
+        long m = tokens[1].toInt();
+        if (m >= 1 && m <= 2047 && synth.setModulus((uint16_t)m)) {
+            Serial.print(F("Fixed MOD set to ")); Serial.println(m);
+        } else {
+            Serial.println(F("MOD must be 1-2047."));
+        }
+    }
+
+    // ── automod <on|off> ─────────────────────────────────────────
+    else if (cmd == "automod") {
+        if (tokenCount < 2) { Serial.println(F("Usage: automod <on|off>")); return; }
+        String v = tokens[1]; v.toLowerCase();
+        if      (v == "on")  { synth.setAutoModulus(true);  Serial.println(F("Auto-MOD on.")); }
+        else if (v == "off") { synth.setAutoModulus(false); Serial.println(F("Auto-MOD off (fixed MOD).")); }
+        else Serial.println(F("Usage: automod <on|off>"));
     }
 
     // ── lockwait <ms> ────────────────────────────────────────────
